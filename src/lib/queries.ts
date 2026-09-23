@@ -10,6 +10,8 @@ const TYPE_PATTERN = /^[a-z0-9]+(\.[a-z0-9]+)*$/;
 const APP_NAME_ALIASES: Record<string, string> = {
   WeChat: "微信",
   Shortcuts: "快捷指令",
+  XIQUEER: "喜鹊儿",
+  Chaoxing: "学习通",
 };
 
 export function normalizeAppName(value: string): string {
