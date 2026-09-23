@@ -299,3 +299,77 @@ export async function deleteEvents(filter: DeleteFilter, sql: postgres.Sql): Pro
   const result = await withRetry(() => sql.unsafe(`DELETE FROM events WHERE ${where}`, values));
   return Number((result as unknown as { count?: number }).count ?? 0);
 }
+
+/** App 使用时长汇总的一行结果 */
+export type UsageSummaryRow = {
+  value: string;
+  totalSeconds: number;
+  sessions: number;
+};
+
+/**
+ * 汇总每个 App 在时间窗内的使用时长。
+ * 用窗口函数把 app.open 与紧随其后的 app.close 配成一次会话；
+ * 重复的 close、落单的 open 会被自然跳过。另返回「当前仍打开」的 App。
+ */
+export async function computeUsageSummary(
+  since: Date,
+  until: Date,
+  sql: postgres.Sql,
+): Promise<{ completed: UsageSummaryRow[]; openNow: UsageSummaryRow[] }> {
+  const completedRows = await withRetry(async () => {
+    const rows = await sql.unsafe(
+      `WITH ordered AS (
+         SELECT value, type, ts,
+                LEAD(type) OVER (PARTITION BY value ORDER BY ts ASC, id ASC) AS next_type,
+                LEAD(ts) OVER (PARTITION BY value ORDER BY ts ASC, id ASC) AS next_ts
+         FROM events
+         WHERE type IN ('app.open','app.close')
+           AND value IS NOT NULL
+           AND ts >= $1 AND ts <= $2
+       )
+       SELECT value,
+              SUM(EXTRACT(EPOCH FROM (next_ts - ts)))::int AS total_seconds,
+              COUNT(*)::int AS sessions
+       FROM ordered
+       WHERE type = 'app.open' AND next_type = 'app.close'
+       GROUP BY value
+       ORDER BY total_seconds DESC`,
+      [since.toISOString(), until.toISOString()],
+    );
+    return rows.map((r: Record<string, unknown>) => ({
+      value: String(r.value),
+      totalSeconds: Number(r.total_seconds ?? 0),
+      sessions: Number(r.sessions ?? 0),
+    }));
+  });
+
+  const lastRows = await withRetry(async () => {
+    const rows = await sql.unsafe(
+      `SELECT DISTINCT ON (value) value, type, ts
+       FROM events
+       WHERE type IN ('app.open','app.close')
+         AND value IS NOT NULL
+         AND ts <= $1
+       ORDER BY value, ts DESC, id DESC`,
+      [until.toISOString()],
+    );
+    return rows.map((r: Record<string, unknown>) => ({
+      value: String(r.value),
+      type: String(r.type),
+      ts: r.ts as string | null,
+    }));
+  });
+
+  const openNow: UsageSummaryRow[] = lastRows
+    .filter((e) => e.type === "app.open")
+    .map((e) => ({
+      value: e.value,
+      totalSeconds: e.ts
+        ? Math.max(0, Math.floor((until.getTime() - new Date(e.ts).getTime()) / 1000))
+        : 0,
+      sessions: 1,
+    }));
+
+  return { completed: completedRows, openNow };
+}
