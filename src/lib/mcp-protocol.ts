@@ -3,6 +3,7 @@ import type postgres from "postgres";
 import type { Env, Vars, JsonRpcId, JsonRpcMessage } from "../types.ts";
 import {
   buildEventSummaryText,
+  computeUsageSummary,
   countMatchingEvents,
   deleteEvents,
   describeDeleteFilter,
@@ -26,7 +27,7 @@ const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set(SUPPORTED_MCP_PROTOCOL_VERSION_L
 const MCP_SERVER_INFO = {
   name: "device-event-logger",
   title: "User Device Event Logger",
-  version: "1.1.0",
+  version: "1.2.0",
   description: "Query and prune user device event records stored in a database.",
 };
 
@@ -195,6 +196,78 @@ const DELETE_EVENTS_TOOL = {
   },
 };
 
+const USAGE_SUMMARY_TOOL = {
+  name: "usage_summary",
+  title: "App Usage Summary",
+  description:
+    "Summarize how long each app has been used in a time window by pairing app.open and app.close events. Returns completed sessions (total duration and session count per app) and apps that are currently still open.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      hours: {
+        type: "number",
+        description: "Look back N hours. Defaults to 24 when since is omitted.",
+        minimum: 0.001,
+      },
+      since: {
+        type: "string",
+        description: "Start time in ISO 8601 format. Overrides the default hours window.",
+      },
+      until: {
+        type: "string",
+        description: "End time in ISO 8601 format. Defaults to now.",
+      },
+      value: {
+        type: "string",
+        description: "Only summarize this specific app value (e.g. '抖音').",
+      },
+    },
+    required: [],
+  },
+  outputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      window: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          since: { type: "string" },
+          until: { type: "string" },
+        },
+        required: ["since", "until"],
+      },
+      completed: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            value: { type: "string" },
+            total_seconds: { type: "integer" },
+            sessions: { type: "integer" },
+          },
+          required: ["value", "total_seconds", "sessions"],
+        },
+      },
+      open_now: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            value: { type: "string" },
+            open_seconds: { type: "integer" },
+          },
+          required: ["value", "open_seconds"],
+        },
+      },
+    },
+    required: ["window", "completed", "open_now"],
+  },
+};
+
 function jsonRpcError(id: JsonRpcId, code: number, message: string, data?: unknown) {
   return {
     jsonrpc: "2.0" as const,
@@ -324,6 +397,108 @@ async function callDeleteEventsTool(
   }
 }
 
+function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}小时${m}分`;
+  if (m > 0) return `${m}分${sec}秒`;
+  return `${sec}秒`;
+}
+
+async function callUsageSummaryTool(
+  args: Record<string, unknown>,
+  sql: postgres.Sql,
+) {
+  const rawHours = args.hours;
+  const rawSince = args.since;
+  const rawUntil = args.until;
+  const rawValue = args.value;
+
+  let since: Date;
+  if (rawHours != null && rawHours !== "") {
+    const hours = Number(rawHours);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      return { content: [{ type: "text", text: "Invalid 'hours'" }], isError: true };
+    }
+    since = new Date(Date.now() - hours * 3600_000);
+  } else if (rawSince != null && String(rawSince).trim()) {
+    since = new Date(String(rawSince));
+    if (Number.isNaN(since.getTime())) {
+      return { content: [{ type: "text", text: "Invalid 'since' format" }], isError: true };
+    }
+  } else {
+    since = new Date(Date.now() - 24 * 3600_000);
+  }
+
+  let until: Date;
+  if (rawUntil != null && String(rawUntil).trim()) {
+    until = new Date(String(rawUntil));
+    if (Number.isNaN(until.getTime())) {
+      return { content: [{ type: "text", text: "Invalid 'until' format" }], isError: true };
+    }
+  } else {
+    until = new Date();
+  }
+
+  if (until.getTime() < since.getTime()) {
+    return {
+      content: [{ type: "text", text: "'until' must be greater than or equal to 'since'" }],
+      isError: true,
+    };
+  }
+
+  const value = rawValue == null || String(rawValue).trim() === "" ? undefined : String(rawValue);
+
+  try {
+    const { completed, openNow } = await computeUsageSummary(since, until, sql);
+
+    const filteredCompleted = value ? completed.filter((row) => row.value === value) : completed;
+    const filteredOpenNow = value ? openNow.filter((row) => row.value === value) : openNow;
+
+    const lines: string[] = [];
+    if (filteredCompleted.length) {
+      lines.push("已完成会话（App 使用时长）：");
+      for (const row of filteredCompleted) {
+        lines.push(`- ${row.value}: ${formatDuration(row.totalSeconds)}（${row.sessions}次）`);
+      }
+    } else {
+      lines.push("该时间窗内没有已完成的 App 会话。");
+    }
+
+    if (filteredOpenNow.length) {
+      lines.push("", "正在打开：");
+      for (const row of filteredOpenNow) {
+        lines.push(`- ${row.value}: 已打开 ${formatDuration(row.totalSeconds)}`);
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      structuredContent: {
+        window: { since: since.toISOString(), until: until.toISOString() },
+        completed: filteredCompleted.map((r) => ({
+          value: r.value,
+          total_seconds: r.totalSeconds,
+          sessions: r.sessions,
+        })),
+        open_now: filteredOpenNow.map((r) => ({
+          value: r.value,
+          open_seconds: r.totalSeconds,
+        })),
+      },
+      isError: false,
+    };
+  } catch (error) {
+    console.error("MCP usage_summary failed:", error);
+    return {
+      content: [{ type: "text", text: "Database error while summarizing usage." }],
+      isError: true,
+    };
+  }
+}
+
 async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offsetMinutes: number) {
   const id = (message.id ?? null) as JsonRpcId;
   const method = typeof message.method === "string" ? message.method : "";
@@ -347,6 +522,7 @@ async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offs
         serverInfo: MCP_SERVER_INFO,
         instructions:
           "This server exposes user device event records. Use list_event_types to discover available event types, then use query_events to read records by time range, type, and value. " +
+          "use usage_summary to see how long each app has been used. " +
           "delete_events removes records permanently: always run it once without confirm to preview the match count, show that count to the user, and only re-run it with confirm=true after they agree.",
       });
     }
@@ -356,7 +532,7 @@ async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offs
       return jsonRpcResult(id, {});
     case "tools/list":
       return jsonRpcResult(id, {
-        tools: [QUERY_EVENTS_TOOL, LIST_EVENT_TYPES_TOOL, DELETE_EVENTS_TOOL],
+        tools: [QUERY_EVENTS_TOOL, LIST_EVENT_TYPES_TOOL, DELETE_EVENTS_TOOL, USAGE_SUMMARY_TOOL],
       });
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
@@ -368,6 +544,9 @@ async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offs
       }
       if (name === DELETE_EVENTS_TOOL.name) {
         return jsonRpcResult(id, await callDeleteEventsTool(args, sql, offsetMinutes));
+      }
+      if (name === USAGE_SUMMARY_TOOL.name) {
+        return jsonRpcResult(id, await callUsageSummaryTool(args, sql));
       }
       if (name !== QUERY_EVENTS_TOOL.name) {
         return jsonRpcError(id, -32601, `Unknown tool: ${name || "(empty)"}`);
