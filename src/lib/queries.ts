@@ -6,6 +6,16 @@ import { withRetry } from "./db.ts";
 /** 与建表时 CHECK 约束一致的事件类型格式 */
 const TYPE_PATTERN = /^[a-z0-9]+(\.[a-z0-9]+)*$/;
 
+/** 同一 App 在不同触发下会报中英文两个名字，这里归一 */
+const APP_NAME_ALIASES: Record<string, string> = {
+  WeChat: "微信",
+  Shortcuts: "快捷指令",
+};
+
+export function normalizeAppName(value: string): string {
+  return APP_NAME_ALIASES[value] ?? value;
+}
+
 export function parseEventQueryFromUrl(url: URL): EventQuery | { error: string } {
   const result = parseEventQuery({
     hours: url.searchParams.get("hours") ?? undefined,
@@ -307,6 +317,22 @@ export type UsageSummaryRow = {
   sessions: number;
 };
 
+/** 把别名的名字归一后再合并：微信/WeChat 这类中英文重复会被并成一条 */
+function mergeUsageRows(rows: UsageSummaryRow[]): UsageSummaryRow[] {
+  const map = new Map<string, UsageSummaryRow>();
+  for (const row of rows) {
+    const name = normalizeAppName(row.value);
+    const existing = map.get(name);
+    if (existing) {
+      existing.totalSeconds += row.totalSeconds;
+      existing.sessions += row.sessions;
+    } else {
+      map.set(name, { value: name, totalSeconds: row.totalSeconds, sessions: row.sessions });
+    }
+  }
+  return [...map.values()].sort((a, b) => b.totalSeconds - a.totalSeconds);
+}
+
 /**
  * 汇总每个 App 在时间窗内的使用时长。
  * 用窗口函数把 app.open 与紧随其后的 app.close 配成一次会话；
@@ -361,7 +387,7 @@ export async function computeUsageSummary(
     }));
   });
 
-  const openNow: UsageSummaryRow[] = lastRows
+  const rawOpenNow: UsageSummaryRow[] = lastRows
     .filter((e) => e.type === "app.open")
     .map((e) => ({
       value: e.value,
@@ -371,5 +397,16 @@ export async function computeUsageSummary(
       sessions: 1,
     }));
 
-  return { completed: completedRows, openNow };
+  // openNow 用「最近一次打开」取最小值去重，不累加
+  const openNowMap = new Map<string, UsageSummaryRow>();
+  for (const row of rawOpenNow) {
+    const name = normalizeAppName(row.value);
+    const existing = openNowMap.get(name);
+    if (!existing || row.totalSeconds < existing.totalSeconds) {
+      openNowMap.set(name, { value: name, totalSeconds: row.totalSeconds, sessions: 1 });
+    }
+  }
+  const openNow = [...openNowMap.values()].sort((a, b) => b.totalSeconds - a.totalSeconds);
+
+  return { completed: mergeUsageRows(completedRows), openNow };
 }
