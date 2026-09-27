@@ -9,6 +9,7 @@
   "tasks": {
     "dev": "deno run --allow-net --allow-env --allow-read entry/deno.ts",
     "start": "deno run --allow-net --allow-env entry/deno.ts",
-    "test": "deno test --allow-net --allow-env"
+    "test": "deno test --allow-net --allow-env",
+    "desire": "deno run --allow-net --allow-env cron/desire.ts"
   }
 }
