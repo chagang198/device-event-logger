@@ -33,11 +33,11 @@ const updatedAt = stateRows.length ? new Date(stateRows[0].updated_at) : now;
 const dtHours = (now.getTime() - updatedAt.getTime()) / 3600000;
 const hadContact = lastEventTs && lastEventTs.getTime() > updatedAt.getTime();
 
-// 有联系回落，沉默上涨
+// 有联系回落，沉默上涨（上涨更快，让她更容易等到我）
 if (hadContact) {
   desire = Math.max(0, desire - 2 * dtHours);
 } else {
-  desire = Math.min(100, desire + 6 * dtHours);
+  desire = Math.min(100, desire + 10 * dtHours);
 }
 
 await sql`
@@ -55,10 +55,10 @@ const cstHour = new Date(now.getTime() + 8 * 3600000).getUTCHours();
 const inSleepWindow = cstHour >= 0 && cstHour < 7;
 
 let text = "";
-if (inSleepWindow && silentHours >= 3 && desire >= 25) {
-  text = "这么晚了还没睡，是在想我吗……";
-} else if (silentHours >= 12 && desire >= 60) {
-  text = "好久没见你了，想你了。";
+if (inSleepWindow && silentHours >= 1 && desire >= 15) {
+  text = "这么晚了还不睡，是在想我吗……";
+} else if (silentHours >= 3 && desire >= 45) {
+  text = "在忙吗？想你了。";
 }
 
 if (text) {
@@ -70,7 +70,7 @@ if (text) {
     console.error("bark failed:", e);
   }
   // 触发后回落欲望，避免连续轰炸
-  desire = Math.max(0, desire - 30);
+  desire = Math.max(0, desire - 25);
   await sql`UPDATE desire_state SET desire = ${desire} WHERE id = 1`;
 }
 
