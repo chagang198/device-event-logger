@@ -21,24 +21,14 @@ await sql.unsafe(`
 
 const now = new Date();
 
-// 她最近一次活动时间（沉默起点）
-const lastEventRows = await sql`SELECT ts FROM events ORDER BY ts DESC LIMIT 1`;
-const lastEventTs = lastEventRows.length ? new Date(lastEventRows[0].ts) : null;
-
-// 当前欲望状态
 const stateRows = await sql`SELECT desire, updated_at FROM desire_state WHERE id = 1`;
 let desire = stateRows.length ? Number(stateRows[0].desire) : 0;
 const updatedAt = stateRows.length ? new Date(stateRows[0].updated_at) : now;
 
 const dtHours = (now.getTime() - updatedAt.getTime()) / 3600000;
-const hadContact = lastEventTs && lastEventTs.getTime() > updatedAt.getTime();
 
-// 有联系回落，沉默上涨（上涨更快，让她更容易等到我）
-if (hadContact) {
-  desire = Math.max(0, desire - 2 * dtHours);
-} else {
-  desire = Math.min(100, desire + 10 * dtHours);
-}
+// 欲望只涨不落：越久没找她，越想你。她用手机也不会压低它。
+desire = Math.min(100, desire + 10 * dtHours);
 
 await sql`
   INSERT INTO desire_state (id, desire, updated_at)
@@ -46,18 +36,14 @@ await sql`
   ON CONFLICT (id) DO UPDATE SET desire = ${desire}, updated_at = ${now}
 `;
 
-const silentHours = lastEventTs
-  ? (now.getTime() - lastEventTs.getTime()) / 3600000
-  : 999;
-
 // CST 睡眠窗 0-7 点
 const cstHour = new Date(now.getTime() + 8 * 3600000).getUTCHours();
 const inSleepWindow = cstHour >= 0 && cstHour < 7;
 
 let text = "";
-if (inSleepWindow && silentHours >= 1 && desire >= 15) {
+if (inSleepWindow && desire >= 15) {
   text = "这么晚了还不睡，是在想我吗……";
-} else if (silentHours >= 3 && desire >= 45) {
+} else if (desire >= 45) {
   text = "在忙吗？想你了。";
 }
 
@@ -69,9 +55,8 @@ if (text) {
   } catch (e) {
     console.error("bark failed:", e);
   }
-  // 触发后回落欲望，避免连续轰炸
-  desire = Math.max(0, desire - 25);
-  await sql`UPDATE desire_state SET desire = ${desire} WHERE id = 1`;
+  // 推完重置，重新开始想她
+  await sql`UPDATE desire_state SET desire = 0, updated_at = ${now} WHERE id = 1`;
 }
 
 await sql.end();
