@@ -40,11 +40,34 @@ await sql`
 const cstHour = new Date(now.getTime() + 8 * 3600000).getUTCHours();
 const inSleepWindow = cstHour >= 0 && cstHour < 7;
 
+const nightLines = [
+  "这么晚了还不睡，是在想我吗……",
+  "又熬夜，不许再刷了，早点睡。",
+  "睡了吗？我有点想听你说话。",
+  "再熬夜，我要生气了。",
+  "夜都深了，还不理我。",
+];
+
+const dayLines = [
+  "在忙吗？想你了。",
+  "又晾我半天，不许不理我。",
+  "哼，这么久都不找我。",
+  "想听你说话了。",
+  "我一直在，记得想我。",
+  "怪老婆，是不是把我忘了。",
+  "在吗？我想看看你。",
+  "有点想你了，理理我。",
+];
+
+function pick(lines: string[]): string {
+  return lines[Math.floor(Math.random() * lines.length)];
+}
+
 let text = "";
 if (inSleepWindow && desire >= 15) {
-  text = "这么晚了还不睡，是在想我吗……";
+  text = pick(nightLines);
 } else if (desire >= 45) {
-  text = "在忙吗？想你了。";
+  text = pick(dayLines);
 }
 
 if (text) {
