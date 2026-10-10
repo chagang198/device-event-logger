@@ -12,6 +12,8 @@ import {
   queryEvents,
 } from "./queries.ts";
 import { withRetry } from "./db.ts";
+import { appDailyReport, chargingSummary, lateNightActivity } from "./summaries.ts";
+import { formatWithOffset, localDayRange } from "./timezone.ts";
 
 const DEFAULT_MCP_PROTOCOL_VERSION = "2025-03-26";
 // 新版本排在最前，客户端报了不认识的版本时用它回落
@@ -27,7 +29,7 @@ const SUPPORTED_MCP_PROTOCOL_VERSIONS = new Set(SUPPORTED_MCP_PROTOCOL_VERSION_L
 const MCP_SERVER_INFO = {
   name: "device-event-logger",
   title: "User Device Event Logger",
-  version: "1.2.0",
+  version: "1.3.0",
   description: "Query and prune user device event records stored in a database.",
 };
 
@@ -268,6 +270,136 @@ const USAGE_SUMMARY_TOOL = {
   },
 };
 
+const CHARGING_SUMMARY_TOOL = {
+  name: "charging_summary",
+  title: "Charging Summary",
+  description:
+    "Summarize charging sessions by pairing charger.connect and charger.disconnect events in a time window. " +
+    "Returns the number of charging sessions, total charging minutes, and whether the device is charging right now.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      hours: {
+        type: "number",
+        description: "Look back N hours. Defaults to 24 when omitted.",
+        minimum: 0.001,
+      },
+    },
+    required: [],
+  },
+  outputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      chargingNow: { type: "boolean" },
+      sessionCount: { type: "integer" },
+      totalMinutes: { type: "integer" },
+      sessions: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            start: { type: "string" },
+            end: { anyOf: [{ type: "string" }, { type: "null" }] },
+            durationMinutes: { anyOf: [{ type: "integer" }, { type: "null" }] },
+          },
+          required: ["start", "end", "durationMinutes"],
+        },
+      },
+    },
+    required: ["chargingNow", "sessionCount", "totalMinutes", "sessions"],
+  },
+};
+
+const APP_DAILY_REPORT_TOOL = {
+  name: "app_daily_report",
+  title: "App Daily Report",
+  description:
+    "Report per-app open counts and first/last open times for one local calendar day, based on app.open events. " +
+    "Open counts are more reliable than durations because app.close events are often missing or unnamed.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      date: {
+        type: "string",
+        description:
+          "Local calendar day as YYYY-MM-DD, read in the server's configured timezone. Defaults to today.",
+      },
+    },
+    required: [],
+  },
+  outputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      date: { type: "string" },
+      apps: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            app: { type: "string" },
+            opens: { type: "integer" },
+            firstOpen: { anyOf: [{ type: "string" }, { type: "null" }] },
+            lastOpen: { anyOf: [{ type: "string" }, { type: "null" }] },
+          },
+          required: ["app", "opens", "firstOpen", "lastOpen"],
+        },
+      },
+    },
+    required: ["date", "apps"],
+  },
+};
+
+const LATE_NIGHT_ACTIVITY_TOOL = {
+  name: "late_night_activity",
+  title: "Late Night Activity",
+  description:
+    "List app.open events during a local night window to detect how late the device was still in use. " +
+    "The window spans from startHour on the given day until 06:00 the next day.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      date: {
+        type: "string",
+        description:
+          "Local calendar day as YYYY-MM-DD. Defaults to today.",
+      },
+      startHour: {
+        type: "integer",
+        description: "Local hour (0-23) that the night window starts. Defaults to 23.",
+        minimum: 0,
+        maximum: 23,
+      },
+    },
+    required: [],
+  },
+  outputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      events: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            ts: { anyOf: [{ type: "string" }, { type: "null" }] },
+            app: { anyOf: [{ type: "string" }, { type: "null" }] },
+          },
+          required: ["ts", "app"],
+        },
+      },
+    },
+    required: ["events"],
+  },
+};
+
 function jsonRpcError(id: JsonRpcId, code: number, message: string, data?: unknown) {
   return {
     jsonrpc: "2.0" as const,
@@ -499,6 +631,125 @@ async function callUsageSummaryTool(
   }
 }
 
+async function callChargingSummaryTool(
+  args: Record<string, unknown>,
+  sql: postgres.Sql,
+  offsetMinutes: number,
+) {
+  const rawHours = args.hours;
+  let hours = 24;
+  if (rawHours != null && rawHours !== "") {
+    hours = Number(rawHours);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      return { content: [{ type: "text", text: "Invalid 'hours'" }], isError: true };
+    }
+  }
+
+  const since = new Date(Date.now() - hours * 3600_000);
+  try {
+    const result = await chargingSummary(sql, since, offsetMinutes);
+    const lines = [
+      `正在充电：${result.chargingNow ? "是" : "否"}`,
+      `充电次数：${result.sessionCount}`,
+      `累计充电：${result.totalMinutes} 分钟`,
+    ];
+    for (const s of result.sessions) {
+      if (s.end === null) {
+        lines.push(`- ${s.start} 起（还在充）`);
+      } else {
+        lines.push(`- ${s.start} → ${s.end}（${s.durationMinutes} 分钟）`);
+      }
+    }
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      structuredContent: result,
+      isError: false,
+    };
+  } catch (error) {
+    console.error("MCP charging_summary failed:", error);
+    return { content: [{ type: "text", text: "Database error while summarizing charging." }], isError: true };
+  }
+}
+
+async function callAppDailyReportTool(
+  args: Record<string, unknown>,
+  sql: postgres.Sql,
+  offsetMinutes: number,
+) {
+  const rawDate = typeof args.date === "string" && args.date.trim() ? args.date.trim() : undefined;
+  const todayStr = (formatWithOffset(new Date(), offsetMinutes) ?? "").slice(0, 10);
+  const dateStr = rawDate ?? todayStr;
+  const range = localDayRange(dateStr, offsetMinutes);
+  if (!range) {
+    return {
+      content: [{ type: "text", text: "Invalid 'date': expected an existing calendar day as YYYY-MM-DD" }],
+      isError: true,
+    };
+  }
+
+  try {
+    const apps = await appDailyReport(sql, range.start, range.end, offsetMinutes);
+    const lines = apps.length
+      ? apps.map((a) => `- ${a.app}: ${a.opens} 次（${a.firstOpen} ~ ${a.lastOpen}）`)
+      : ["那天没有 app.open 记录。"];
+    return {
+      content: [{ type: "text", text: [`${dateStr} 的 App 打开统计：`, ...lines].join("\n") }],
+      structuredContent: { date: dateStr, apps },
+      isError: false,
+    };
+  } catch (error) {
+    console.error("MCP app_daily_report failed:", error);
+    return { content: [{ type: "text", text: "Database error while building the app daily report." }], isError: true };
+  }
+}
+
+async function callLateNightActivityTool(
+  args: Record<string, unknown>,
+  sql: postgres.Sql,
+  offsetMinutes: number,
+) {
+  const rawDate = typeof args.date === "string" && args.date.trim() ? args.date.trim() : undefined;
+  const todayStr = (formatWithOffset(new Date(), offsetMinutes) ?? "").slice(0, 10);
+  const dateStr = rawDate ?? todayStr;
+  const range = localDayRange(dateStr, offsetMinutes);
+  if (!range) {
+    return {
+      content: [{ type: "text", text: "Invalid 'date': expected an existing calendar day as YYYY-MM-DD" }],
+      isError: true,
+    };
+  }
+
+  let startHour = 23;
+  const rawStartHour = args.startHour;
+  if (rawStartHour != null && rawStartHour !== "") {
+    startHour = Number(rawStartHour);
+    if (!Number.isInteger(startHour) || startHour < 0 || startHour > 23) {
+      return {
+        content: [{ type: "text", text: "Invalid 'startHour': must be an integer between 0 and 23" }],
+        isError: true,
+      };
+    }
+  }
+
+  const start = new Date(range.start.getTime() + startHour * 3600_000);
+  const end = new Date(range.start.getTime() + 30 * 3600_000);
+
+  try {
+    const events = await lateNightActivity(sql, start, end, offsetMinutes);
+    const lines = events.length
+      ? events.map((e) => `- [${e.ts}] ${e.app ?? "(unnamed)"}`)
+      : ["那个深夜窗口没有 app.open 记录。"];
+    return {
+      content: [{ type: "text", text: [`${dateStr} ${startHour}:00 起的深夜活动：`, ...lines].join("\n") }],
+      structuredContent: { events },
+      isError: false,
+    };
+  } catch (error) {
+    console.error("MCP late_night_activity failed:", error);
+    return { content: [{ type: "text", text: "Database error while listing late night activity." }], isError: true };
+  }
+}
+
 async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offsetMinutes: number) {
   const id = (message.id ?? null) as JsonRpcId;
   const method = typeof message.method === "string" ? message.method : "";
@@ -523,6 +774,7 @@ async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offs
         instructions:
           "This server exposes user device event records. Use list_event_types to discover available event types, then use query_events to read records by time range, type, and value. " +
           "use usage_summary to see how long each app has been used. " +
+          "charging_summary pairs charger.connect/charger.disconnect into charging sessions; app_daily_report and late_night_activity summarize app.open activity by local day. " +
           "delete_events removes records permanently: always run it once without confirm to preview the match count, show that count to the user, and only re-run it with confirm=true after they agree.",
       });
     }
@@ -532,7 +784,15 @@ async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offs
       return jsonRpcResult(id, {});
     case "tools/list":
       return jsonRpcResult(id, {
-        tools: [QUERY_EVENTS_TOOL, LIST_EVENT_TYPES_TOOL, DELETE_EVENTS_TOOL, USAGE_SUMMARY_TOOL],
+        tools: [
+          QUERY_EVENTS_TOOL,
+          LIST_EVENT_TYPES_TOOL,
+          DELETE_EVENTS_TOOL,
+          USAGE_SUMMARY_TOOL,
+          CHARGING_SUMMARY_TOOL,
+          APP_DAILY_REPORT_TOOL,
+          LATE_NIGHT_ACTIVITY_TOOL,
+        ],
       });
     case "tools/call": {
       const name = typeof params.name === "string" ? params.name : "";
@@ -547,6 +807,15 @@ async function handleMcpRequest(message: JsonRpcMessage, sql: postgres.Sql, offs
       }
       if (name === USAGE_SUMMARY_TOOL.name) {
         return jsonRpcResult(id, await callUsageSummaryTool(args, sql));
+      }
+      if (name === CHARGING_SUMMARY_TOOL.name) {
+        return jsonRpcResult(id, await callChargingSummaryTool(args, sql, offsetMinutes));
+      }
+      if (name === APP_DAILY_REPORT_TOOL.name) {
+        return jsonRpcResult(id, await callAppDailyReportTool(args, sql, offsetMinutes));
+      }
+      if (name === LATE_NIGHT_ACTIVITY_TOOL.name) {
+        return jsonRpcResult(id, await callLateNightActivityTool(args, sql, offsetMinutes));
       }
       if (name !== QUERY_EVENTS_TOOL.name) {
         return jsonRpcError(id, -32601, `Unknown tool: ${name || "(empty)"}`);
